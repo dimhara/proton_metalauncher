@@ -397,7 +397,8 @@ unsafe fn launch_selected(hwnd: win32::HWND) {
     }
 
     match command.spawn() {
-        Ok(_) => PostQuitMessage(0),
+        // Stay open so another entry can be launched.
+        Ok(_) => {}
         Err(error) => {
             let message = format!(
                 "Failed to launch \"{}\":\n{}\n\nPath: {}\nCWD: {}",

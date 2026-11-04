@@ -3,7 +3,9 @@
 A tiny, dependency-free Win32 launcher for Wine/Proton prefixes. It shows a
 native window with one radio button per application found in
 `C:\proton_shortcuts`, launches the selected executable (with optional
-arguments, working directory and environment variables), and exits immediately.
+arguments, working directory and environment variables). After a successful
+launch the launcher stays open, so you can start another entry; **Escape** or
+**Cancel** closes it.
 
 ## Usage
 
@@ -22,8 +24,8 @@ arguments, working directory and environment variables), and exits immediately.
 3. Run `launcher.exe` once (for example through Proton). On first start it
    scans the shortcuts folder, writes `config.yaml` into it, and shows the
    application list.
-4. Select an entry and press **Launch** (or `Enter`). `Escape` or **Cancel**
-   closes the launcher.
+4. Select an entry and press **Launch** (or `Enter`). The window stays open;
+   `Escape` or **Cancel** closes the launcher.
 
 If `config.yaml` already exists and lists at least one app, `.desktop` files
 are ignored. An empty `config.yaml` (no apps) is regenerated from the
