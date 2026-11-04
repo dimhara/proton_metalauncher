@@ -1,0 +1,19 @@
+[package]
+name = "launcher"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal Win32 app launcher for Wine/Proton"
+license = "MIT"
+
+[[bin]]
+name = "launcher"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dependencies]

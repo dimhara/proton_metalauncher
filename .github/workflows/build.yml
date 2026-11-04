@@ -1,0 +1,63 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install MinGW cross compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+
+      - name: Install Windows Rust target
+        run: rustup target add x86_64-pc-windows-gnu
+
+      # No actions/checkout: fetch the exact ref with plain git instead.
+      - name: Fetch source
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git init -q .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git" 2>/dev/null || \
+            git remote set-url origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          auth="$(printf 'x-access-token:%s' "${GITHUB_TOKEN}" | base64)"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
+            fetch -q --depth 1 origin "${GITHUB_REF}"
+          git checkout -q FETCH_HEAD
+
+      - name: Test host-side logic
+        run: cargo test --quiet
+
+      - name: Build launcher.exe
+        run: |
+          cargo build --release --target x86_64-pc-windows-gnu
+          cp target/x86_64-pc-windows-gnu/release/launcher.exe launcher.exe
+          x86_64-w64-mingw32-strip launcher.exe
+          sha256sum launcher.exe > launcher.exe.sha256
+          ls -l launcher.exe
+
+      - name: Publish release asset
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="nightly"
+          fi
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" \
+              --title "$tag" \
+              --notes "Automated build of ${GITHUB_SHA}" \
+              --target "${GITHUB_SHA}"
+          gh release upload "$tag" launcher.exe launcher.exe.sha256 --clobber
