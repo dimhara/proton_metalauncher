@@ -54,8 +54,12 @@ cargo build --release --target x86_64-pc-windows-gnu
 cp target/x86_64-pc-windows-gnu/release/launcher.exe .
 ```
 
-CI builds and publishes `launcher.exe`: pushing a tag publishes a release
-under that tag, and manual workflow runs publish under `nightly`.
+CI builds `launcher.exe` and overwrites the rolling `latest` release on every
+push, so this link always downloads the newest build:
+
+<https://github.com/dimhara/proton_metalauncher/releases/latest/download/launcher.exe>
+
+The matching checksum is `launcher.exe.sha256` next to it.
 
 ## Notes
 

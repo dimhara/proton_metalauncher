@@ -47,19 +47,17 @@ jobs:
           sha256sum launcher.exe > launcher.exe.sha256
           ls -l launcher.exe
 
-      - name: Publish release asset
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+      # One rolling release, overwritten on every non-PR build, so the
+      # download link is always the latest binary.
+      - name: Publish latest release
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            tag="${GITHUB_REF_NAME}"
-          else
-            tag="nightly"
-          fi
-          gh release view "$tag" >/dev/null 2>&1 || \
-            gh release create "$tag" \
-              --title "$tag" \
+          gh release view latest >/dev/null 2>&1 || \
+            gh release create latest \
+              --title "Latest build" \
               --notes "Automated build of ${GITHUB_SHA}" \
               --target "${GITHUB_SHA}"
-          gh release upload "$tag" launcher.exe launcher.exe.sha256 --clobber
+          gh release edit latest --notes "Automated build of ${GITHUB_SHA}"
+          gh release upload latest launcher.exe launcher.exe.sha256 --clobber
