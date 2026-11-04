@@ -41,7 +41,15 @@ apps:
       DXVK_HUD: "fps"
 ```
 
-Delete `config.yaml` to force a full rescan of the `.desktop` files.
+`Exec=` may point at a Windows `.lnk` shortcut. The launcher resolves it with
+`IShellLinkW`, appends the shortcut's own parameters, and starts the real target
+with `args`/`cwd`/`env` from the config; if resolution fails it falls back to
+`explorer.exe`. Wine-style `Path=` values (`.../dosdevices/c:/Program Files/...`)
+are rewritten to `C:\Program Files\...`.
+
+Delete `config.yaml` to force a full rescan of the `.desktop` files. (Do this
+once after upgrading from a version that mangled `.lnk` paths, such as a split
+`Exec=` with the remainder in `args`.)
 
 ## Build
 

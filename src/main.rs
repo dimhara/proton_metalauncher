@@ -348,12 +348,43 @@ unsafe fn launch_selected(hwnd: win32::HWND) {
         return;
     };
 
-    let mut command = Command::new(&app.path);
-    command.args(&app.args);
-    if let Some(cwd) = app.cwd.as_deref() {
-        if !cwd.is_empty() {
-            command.current_dir(cwd);
+    let path = desktop::normalize_windows_path(&app.path);
+    let mut command;
+    let mut shortcut_cwd = None;
+
+    if path.to_ascii_lowercase().ends_with(".lnk") {
+        match resolve_shortcut(&path) {
+            Some(shortcut) => {
+                command = Command::new(desktop::normalize_windows_path(&shortcut.target));
+                command.args(&app.args);
+                if !shortcut.args.is_empty() {
+                    use std::os::windows::process::CommandExt;
+                    command.raw_arg(&shortcut.args);
+                }
+                if !shortcut.cwd.is_empty() {
+                    shortcut_cwd = Some(desktop::normalize_windows_path(&shortcut.cwd));
+                }
+            }
+            // Advertised or exotic shortcuts may not resolve to a path; let
+            // the shell open those instead.
+            None => {
+                command = Command::new("explorer.exe");
+                command.arg(&path);
+            }
         }
+    } else {
+        command = Command::new(&path);
+        command.args(&app.args);
+    }
+
+    let cwd = app
+        .cwd
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(|value| desktop::windows_cwd(value).unwrap_or_else(|| value.to_string()))
+        .or(shortcut_cwd);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
     }
     for (key, value) in &app.env {
         command.env(key, value);
@@ -372,10 +403,126 @@ unsafe fn launch_selected(hwnd: win32::HWND) {
                 "Failed to launch \"{}\":\n{}\n\nPath: {}\nCWD: {}",
                 app.name,
                 error,
-                app.path,
+                path,
                 app.cwd.as_deref().unwrap_or("(inherited)")
             );
             message_box(hwnd, &message, "Proton App Launcher", MB_OK | MB_ICONERROR);
         }
     }
+}
+
+struct Shortcut {
+    target: String,
+    args: String,
+    cwd: String,
+}
+
+/// Resolves a `.lnk` target with `IShellLinkW`, so the target can be started
+/// with the configured arguments, working directory and environment.
+///
+/// `ole32.dll` is loaded at runtime; only `user32` and `kernel32` are linked.
+#[cfg(windows)]
+unsafe fn resolve_shortcut(path: &str) -> Option<Shortcut> {
+    use std::ffi::c_void;
+    use win32::*;
+
+    const COINIT_APARTMENTTHREADED: u32 = 0x0002;
+    const CLSCTX_INPROC_SERVER: u32 = 0x0001;
+    const STGM_READ: u32 = 0x0000;
+    const SLGP_DEFAULT: u32 = 0x0000;
+    const SLR_NO_UI: u32 = 0x0001;
+    const RPC_E_CHANGED_MODE: HRESULT = 0x8001_0106u32 as i32;
+
+    let ole = Ole32::load()?;
+    let hr = (ole.co_initialize_ex)(std::ptr::null_mut(), COINIT_APARTMENTTHREADED);
+    if hr < 0 && hr != RPC_E_CHANGED_MODE {
+        return None;
+    }
+    let initialized = hr >= 0;
+
+    let mut link: *mut c_void = std::ptr::null_mut();
+    let hr = (ole.co_create_instance)(
+        &CLSID_SHELL_LINK,
+        std::ptr::null_mut(),
+        CLSCTX_INPROC_SERVER,
+        &IID_ISHELL_LINKW,
+        &mut link,
+    );
+    let mut resolved = None;
+    if hr >= 0 && !link.is_null() {
+        let link_vtbl = *(link as *mut *const IUnknownVtbl);
+        let mut persist: *mut c_void = std::ptr::null_mut();
+        let hr = ((*link_vtbl).query_interface)(link, &IID_IPERSIST_FILE, &mut persist);
+        if hr >= 0 && !persist.is_null() {
+            let persist_vtbl = *(persist as *mut *const IPersistFileVtbl);
+            let wide_path = wide(path);
+            if ((*persist_vtbl).load)(persist, wide_path.as_ptr(), STGM_READ) >= 0 {
+                resolved = read_link_target(link, SLGP_DEFAULT, SLR_NO_UI);
+            }
+            ((*persist_vtbl).base.release)(persist);
+        }
+        ((*link_vtbl).release)(link);
+    }
+    if initialized {
+        (ole.co_uninitialize)();
+    }
+    resolved
+}
+
+#[cfg(windows)]
+unsafe fn read_link_target(
+    link: *mut std::ffi::c_void,
+    path_flags: u32,
+    resolve_flags: u32,
+) -> Option<Shortcut> {
+    use win32::*;
+
+    let vtbl = *(link as *mut *const IShellLinkWVtbl);
+    let mut target = vec![0u16; 32768];
+    let mut hr = ((*vtbl).get_path)(
+        link,
+        target.as_mut_ptr(),
+        target.len() as i32,
+        std::ptr::null_mut(),
+        path_flags,
+    );
+    if hr < 0 || target[0] == 0 {
+        // Relative or IDList-only shortcuts need an explicit resolve.
+        let _ = ((*vtbl).resolve)(link, std::ptr::null_mut(), resolve_flags);
+        hr = ((*vtbl).get_path)(
+            link,
+            target.as_mut_ptr(),
+            target.len() as i32,
+            std::ptr::null_mut(),
+            path_flags,
+        );
+    }
+    if hr < 0 {
+        return None;
+    }
+    let target = utf16z(&target);
+    if target.is_empty() {
+        return None;
+    }
+
+    let mut args_buf = vec![0u16; 32768];
+    let args = if ((*vtbl).get_arguments)(link, args_buf.as_mut_ptr(), args_buf.len() as i32) >= 0 {
+        utf16z(&args_buf)
+    } else {
+        String::new()
+    };
+    let mut cwd_buf = vec![0u16; 4096];
+    let cwd =
+        if ((*vtbl).get_working_directory)(link, cwd_buf.as_mut_ptr(), cwd_buf.len() as i32) >= 0 {
+            utf16z(&cwd_buf)
+        } else {
+            String::new()
+        };
+
+    Some(Shortcut { target, args, cwd })
+}
+
+fn utf16z(buffer: &[u16]) -> String {
+    let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..len])
 }

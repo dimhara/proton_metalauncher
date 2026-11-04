@@ -71,7 +71,8 @@ fn parse_desktop_file(path: &Path) -> Option<DesktopEntry> {
         let (key, value) = (key.trim(), value.trim());
         match key {
             "Name" if name.is_none() => name = Some(unescape(value)),
-            "Exec" if exec.is_none() => exec = Some(unescape(value)),
+            // Keep `Exec=` raw: `split_exec` owns its escape handling.
+            "Exec" if exec.is_none() => exec = Some(value.to_string()),
             "Path" if cwd.is_none() => cwd = Some(unescape(value)),
             _ => {}
         }
@@ -86,7 +87,9 @@ fn parse_desktop_file(path: &Path) -> Option<DesktopEntry> {
     Some(DesktopEntry {
         name: name.unwrap_or(fallback_name),
         exec: program,
-        path: cwd.filter(|value| !value.is_empty()),
+        // `Path=` is often a host-side Linux path; keep it only when it can
+        // be expressed as a Windows directory.
+        path: cwd.and_then(|value| windows_cwd(&value)),
         args: parts,
     })
 }
@@ -116,15 +119,20 @@ fn unescape(s: &str) -> String {
     out
 }
 
-/// Splits an `Exec=` value into program and arguments, respecting single and
-/// double quotes and dropping `%`-field codes.
+/// Splits an `Exec=` value into program and arguments, respecting quotes and
+/// dropping `%`-field codes.
+///
+/// The files Proton tooling generates are not strictly spec-compliant: Windows
+/// paths are double-escaped (`C:\\\\Games`), and spaces are escaped as `\ ` rather
+/// than `\s`. Both forms are handled here.
 fn split_exec(exec: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut started = false;
     let mut quote: Option<char> = None;
+    let mut chars = exec.chars().peekable();
 
-    for c in exec.chars() {
+    while let Some(c) = chars.next() {
         match quote {
             Some(q) if c == q => quote = None,
             Some(_) => {
@@ -134,6 +142,34 @@ fn split_exec(exec: &str) -> Vec<String> {
             None if c == '"' || c == '\'' => {
                 quote = Some(c);
                 started = true;
+            }
+            None if c == '\\' => {
+                let mut count = 1;
+                while chars.peek() == Some(&'\\') {
+                    chars.next();
+                    count += 1;
+                }
+                match chars.peek() {
+                    Some(next) if next.is_whitespace() => {
+                        // `\ ` (or `\\ `) is an escaped space.
+                        current.push(' ');
+                        chars.next();
+                        started = true;
+                    }
+                    Some('"') | Some('\'') => {
+                        current.push(chars.next().unwrap());
+                        started = true;
+                    }
+                    _ => {
+                        if current.is_empty() && count >= 2 {
+                            // Keep a UNC prefix intact.
+                            current.push_str("\\\\");
+                        } else {
+                            current.push('\\');
+                        }
+                        started = true;
+                    }
+                }
             }
             None if c.is_whitespace() => {
                 if started {
@@ -154,7 +190,79 @@ fn split_exec(exec: &str) -> Vec<String> {
     parts
         .into_iter()
         .filter(|part| !part.starts_with('%'))
+        .map(|part| decode_arg(&part))
         .collect()
+}
+
+fn decode_arg(part: &str) -> String {
+    if is_windows_path(part) {
+        normalize_windows_path(part)
+    } else {
+        unescape(part)
+    }
+}
+
+/// True for `C:\...`, `C:/...` and `\\server\share` paths.
+pub fn is_windows_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/'))
+        || value.starts_with("\\\\")
+}
+
+/// Collapses repeated separators and converts `/` to `\`, keeping a leading
+/// UNC prefix.
+pub fn normalize_windows_path(value: &str) -> String {
+    if !is_windows_path(value) {
+        return value.to_string();
+    }
+    let unc = value.starts_with("\\\\");
+    let body = if unc { &value[2..] } else { value };
+    let mut out = String::with_capacity(value.len());
+    if unc {
+        out.push_str("\\\\");
+    }
+    let mut previous_sep = unc;
+    for c in body.chars() {
+        let c = if c == '/' { '\\' } else { c };
+        if c == '\\' {
+            if !previous_sep {
+                out.push(c);
+            }
+            previous_sep = true;
+        } else {
+            out.push(c);
+            previous_sep = false;
+        }
+    }
+    out
+}
+
+/// Converts a `Path=` value to a Windows directory, or returns `None` when it
+/// cannot be expressed as one. Wine prefixes expose host paths as
+/// `<prefix>/dosdevices/c:/Program Files/...`, which becomes
+/// `C:\Program Files\...`.
+pub fn windows_cwd(value: &str) -> Option<String> {
+    let value = value.trim();
+    if is_windows_path(value) {
+        return Some(normalize_windows_path(value));
+    }
+    let marker = "/dosdevices/";
+    let rest = &value[value.find(marker)? + marker.len()..];
+    let (drive, tail) = rest.split_once(':')?;
+    let mut letters = drive.chars();
+    let letter = letters.next()?;
+    if !letter.is_ascii_alphabetic() || letters.next().is_some() {
+        return None;
+    }
+    let tail: String = tail
+        .trim_start_matches(['/', '\\'])
+        .chars()
+        .map(|c| if c == '/' { '\\' } else { c })
+        .collect();
+    Some(format!("{}:\\{}", letter.to_ascii_uppercase(), tail))
 }
 
 #[cfg(test)]
@@ -196,6 +304,58 @@ mod tests {
         assert_eq!(entry.exec, r"C:\Games\game.exe");
         assert_eq!(entry.path.as_deref(), Some(r"C:\Games"));
         assert_eq!(entry.args, vec!["-dx11"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_double_escaped_shortcut_path() {
+        let dir = temp_dir("lnk-quoted");
+        let file = dir.join("7zip.desktop");
+        fs::write(
+            &file,
+            r#"[Desktop Entry]
+Name=7-Zip File Manager
+Exec="C:\\\\ProgramData\\\\Microsoft\\\\Windows\\\\Start Menu\\\\Programs\\\\7-Zip\\\\7-Zip File Manager.lnk"
+Type=Application
+"#,
+        )
+        .unwrap();
+
+        let entry = parse_desktop_file(&file).unwrap();
+        assert_eq!(
+            entry.exec,
+            r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\7-Zip\7-Zip File Manager.lnk"
+        );
+        assert!(entry.args.is_empty());
+        assert_eq!(entry.path, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn escaped_space_and_dosdevices_cwd_are_normalized() {
+        let dir = temp_dir("lnk-space");
+        let file = dir.join("firefox.desktop");
+        fs::write(
+            &file,
+            r#"[Desktop Entry]
+Name=Firefox
+Exec=C:\\\\ProgramData\\\\Microsoft\\\\Windows\\\\Start\ Menu\\\\Programs\\\\Firefox.lnk
+Path=/home/dosemu/wine/vortex/pfx/dosdevices/c:/Program Files/Mozilla Firefox
+Type=Application
+"#,
+        )
+        .unwrap();
+
+        let entry = parse_desktop_file(&file).unwrap();
+        assert_eq!(
+            entry.exec,
+            r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Firefox.lnk"
+        );
+        assert_eq!(
+            entry.path.as_deref(),
+            Some(r"C:\Program Files\Mozilla Firefox")
+        );
+        assert!(entry.args.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -168,6 +168,9 @@ extern "system" {
 extern "system" {
     pub fn GetModuleHandleW(lpModuleName: LPCWSTR) -> HMODULE;
     pub fn GetLastError() -> DWORD;
+    pub fn LoadLibraryW(lpFileName: LPCWSTR) -> HMODULE;
+    pub fn GetProcAddress(hModule: HMODULE, lpProcName: *const u8) -> *mut c_void;
+    pub fn FreeLibrary(hModule: HMODULE) -> BOOL;
 }
 
 /// Converts a Rust string to a NUL-terminated UTF-16 buffer.
@@ -180,4 +183,133 @@ pub unsafe fn message_box(owner: HWND, text: &str, caption: &str, flags: u32) {
     let text = wide(text);
     let caption = wide(caption);
     MessageBoxW(owner, text.as_ptr(), caption.as_ptr(), flags);
+}
+
+pub type HRESULT = i32;
+
+/// COM GUID (`{data1-data2-data3-data4}`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GUID {
+    pub data1: u32,
+    pub data2: u16,
+    pub data3: u16,
+    pub data4: [u8; 8],
+}
+
+/// `CLSID_ShellLink`.
+pub const CLSID_SHELL_LINK: GUID = GUID {
+    data1: 0x0002_1401,
+    data2: 0,
+    data3: 0,
+    data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
+};
+
+/// `IID_IShellLinkW`.
+pub const IID_ISHELL_LINKW: GUID = GUID {
+    data1: 0x0002_14F9,
+    data2: 0,
+    data3: 0,
+    data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
+};
+
+/// `IID_IPersistFile`.
+pub const IID_IPERSIST_FILE: GUID = GUID {
+    data1: 0x0000_010B,
+    data2: 0,
+    data3: 0,
+    data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
+};
+
+#[repr(C)]
+pub struct IUnknownVtbl {
+    pub query_interface:
+        unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+    pub add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    pub release: unsafe extern "system" fn(*mut c_void) -> u32,
+}
+
+/// Prefix of the `IShellLinkW` vtable up to `GetArguments`.
+#[repr(C)]
+pub struct IShellLinkWVtbl {
+    pub base: IUnknownVtbl,
+    pub get_path:
+        unsafe extern "system" fn(*mut c_void, *mut u16, i32, *mut c_void, u32) -> HRESULT,
+    pub get_id_list: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+    pub set_id_list: unsafe extern "system" fn(*mut c_void, *const c_void) -> HRESULT,
+    pub get_description: unsafe extern "system" fn(*mut c_void, *mut u16, i32) -> HRESULT,
+    pub set_description: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
+    pub get_working_directory: unsafe extern "system" fn(*mut c_void, *mut u16, i32) -> HRESULT,
+    pub set_working_directory: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
+    pub get_arguments: unsafe extern "system" fn(*mut c_void, *mut u16, i32) -> HRESULT,
+    pub set_arguments: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
+    pub get_hotkey: unsafe extern "system" fn(*mut c_void, *mut u16) -> HRESULT,
+    pub set_hotkey: unsafe extern "system" fn(*mut c_void, u16) -> HRESULT,
+    pub get_show_cmd: unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT,
+    pub set_show_cmd: unsafe extern "system" fn(*mut c_void, i32) -> HRESULT,
+    pub get_icon_location:
+        unsafe extern "system" fn(*mut c_void, *mut u16, i32, *mut i32) -> HRESULT,
+    pub set_icon_location: unsafe extern "system" fn(*mut c_void, *const u16, i32) -> HRESULT,
+    pub set_relative_path: unsafe extern "system" fn(*mut c_void, *const u16, u32) -> HRESULT,
+    pub resolve: unsafe extern "system" fn(*mut c_void, HWND, u32) -> HRESULT,
+    pub set_path: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
+}
+
+/// Prefix of the `IPersistFile` vtable up to `Load`.
+#[repr(C)]
+pub struct IPersistFileVtbl {
+    pub base: IUnknownVtbl,
+    pub get_class_id: unsafe extern "system" fn(*mut c_void, *mut GUID) -> HRESULT,
+    pub is_dirty: unsafe extern "system" fn(*mut c_void) -> HRESULT,
+    pub load: unsafe extern "system" fn(*mut c_void, *const u16, u32) -> HRESULT,
+}
+
+pub type CoInitializeExFn = unsafe extern "system" fn(*mut c_void, u32) -> HRESULT;
+pub type CoCreateInstanceFn = unsafe extern "system" fn(
+    *const GUID,
+    *mut c_void,
+    u32,
+    *const GUID,
+    *mut *mut c_void,
+) -> HRESULT;
+pub type CoUninitializeFn = unsafe extern "system" fn();
+
+/// `ole32.dll` loaded on demand so the import table stays `user32`+`kernel32`.
+pub struct Ole32 {
+    module: HMODULE,
+    pub co_initialize_ex: CoInitializeExFn,
+    pub co_create_instance: CoCreateInstanceFn,
+    pub co_uninitialize: CoUninitializeFn,
+}
+
+impl Ole32 {
+    pub fn load() -> Option<Ole32> {
+        unsafe {
+            let module = LoadLibraryW(wide("ole32.dll").as_ptr());
+            if module.is_null() {
+                return None;
+            }
+            let init = GetProcAddress(module, c"CoInitializeEx".as_ptr().cast::<u8>());
+            let create = GetProcAddress(module, c"CoCreateInstance".as_ptr().cast::<u8>());
+            let uninit = GetProcAddress(module, c"CoUninitialize".as_ptr().cast::<u8>());
+            if init.is_null() || create.is_null() || uninit.is_null() {
+                FreeLibrary(module);
+                return None;
+            }
+            Some(Ole32 {
+                module,
+                co_initialize_ex: std::mem::transmute::<*mut c_void, CoInitializeExFn>(init),
+                co_create_instance: std::mem::transmute::<*mut c_void, CoCreateInstanceFn>(create),
+                co_uninitialize: std::mem::transmute::<*mut c_void, CoUninitializeFn>(uninit),
+            })
+        }
+    }
+}
+
+impl Drop for Ole32 {
+    fn drop(&mut self) {
+        unsafe {
+            FreeLibrary(self.module);
+        }
+    }
 }
