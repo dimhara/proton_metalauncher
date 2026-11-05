@@ -22,6 +22,8 @@ use std::sync::OnceLock;
 static CONFIG: OnceLock<LauncherConfig> = OnceLock::new();
 #[cfg(windows)]
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
+#[cfg(windows)]
+static ICONS: OnceLock<Vec<usize>> = OnceLock::new();
 
 #[cfg(windows)]
 const ID_LAUNCH: i32 = 1;
@@ -86,6 +88,25 @@ fn run() -> Result<(), String> {
         ));
     }
     let app_names: Vec<String> = config.apps.iter().map(|app| app.name.clone()).collect();
+
+    // GDI+ stays alive until the message loop has finished; icon handles must
+    // not outlive the loader that created them. Skip it entirely when no app
+    // has an icon so prefixes without gdiplus.dll keep the old startup path.
+    let gdiplus = if config.apps.iter().any(|app| app.icon.is_some()) {
+        Gdiplus::load()
+    } else {
+        None
+    };
+    let icon_handles = unsafe { load_icons(gdiplus.as_ref(), &dir, &config) };
+    let window_icon = icon_handles
+        .iter()
+        .copied()
+        .find(|&handle| handle != 0)
+        .map(|handle| handle as HICON)
+        .unwrap_or(std::ptr::null_mut());
+    let show_icons = icon_handles.iter().any(|&handle| handle != 0);
+    let _ = ICONS.set(icon_handles);
+
     CONFIG
         .set(config)
         .map_err(|_| "configuration was already initialised".to_string())?;
@@ -107,12 +128,12 @@ fn run() -> Result<(), String> {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: instance,
-            hIcon: std::ptr::null_mut(),
+            hIcon: window_icon,
             hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW as LPCWSTR),
             hbrBackground: (COLOR_WINDOW + 1) as HBRUSH,
             lpszMenuName: std::ptr::null(),
             lpszClassName: class_name.as_ptr(),
-            hIconSm: std::ptr::null_mut(),
+            hIconSm: window_icon,
         };
         if RegisterClassExW(&window_class) == 0 {
             return Err(format!(
@@ -121,11 +142,13 @@ fn run() -> Result<(), String> {
             ));
         }
 
-        let radio_height = 26 * app_names.len() as i32;
+        let icon_column = if show_icons { 40 } else { 0 };
+        let row_height = if show_icons { 34 } else { 26 };
+        let radio_height = row_height * app_names.len() as i32;
         let mut rect = RECT {
             left: 0,
             top: 0,
-            right: 440,
+            right: 440 + icon_column,
             bottom: 96 + radio_height,
         };
         AdjustWindowRectEx(&mut rect, WS_OVERLAPPEDWINDOW, 0, 0);
@@ -231,7 +254,34 @@ fn run() -> Result<(), String> {
         }
     }
 
+    drop(gdiplus);
     Ok(())
+}
+
+#[cfg(windows)]
+unsafe fn load_icons(
+    gdiplus: Option<&win32::Gdiplus>,
+    dir: &std::path::Path,
+    config: &LauncherConfig,
+) -> Vec<usize> {
+    config
+        .apps
+        .iter()
+        .map(|app| {
+            let Some(icon) = app.icon.as_deref() else {
+                return 0;
+            };
+            let Some(gdiplus) = gdiplus else {
+                return 0;
+            };
+            for candidate in desktop::icon_candidates(dir, icon) {
+                if let Some(handle) = gdiplus.load_icon(&candidate) {
+                    return handle as usize;
+                }
+            }
+            0
+        })
+        .collect()
 }
 
 #[cfg(windows)]
@@ -270,6 +320,11 @@ unsafe fn layout_controls(hwnd: win32::HWND, app_count: usize) {
     let margin = 16;
     let full_width = (client.right - client.left) - 2 * margin;
     let button_y = (client.bottom - margin) - 32;
+    let show_icons = ICONS
+        .get()
+        .is_some_and(|icons| icons.iter().any(|&handle| handle != 0));
+    let icon_column = if show_icons { 40 } else { 0 };
+    let row_height = if show_icons { 34 } else { 26 };
 
     MoveWindow(GetDlgItem(hwnd, ID_LABEL), margin, 14, full_width, 20, 1);
 
@@ -277,13 +332,13 @@ unsafe fn layout_controls(hwnd: win32::HWND, app_count: usize) {
     for index in 0..app_count {
         MoveWindow(
             GetDlgItem(hwnd, ID_RADIO_BASE + index as i32),
-            margin,
+            margin + icon_column,
             y,
-            full_width,
-            22,
+            full_width - icon_column,
+            if show_icons { 24 } else { 22 },
             1,
         );
-        y += 26;
+        y += row_height;
     }
 
     MoveWindow(
@@ -325,6 +380,36 @@ unsafe extern "system" fn wndproc(
             if let Some(config) = CONFIG.get() {
                 layout_controls(hwnd, config.apps.len());
             }
+            InvalidateRect(hwnd, std::ptr::null(), 1);
+            0
+        }
+        WM_PAINT => {
+            let mut paint = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut paint);
+            FillRect(hdc, &paint.rcPaint, (COLOR_WINDOW + 1) as HBRUSH);
+            if let Some(icons) = ICONS.get() {
+                if icons.iter().any(|&handle| handle != 0) {
+                    let margin = 16;
+                    let mut y = 42;
+                    for &handle in icons {
+                        if handle != 0 {
+                            DrawIconEx(
+                                hdc,
+                                margin,
+                                y,
+                                handle as HICON,
+                                32,
+                                32,
+                                0,
+                                std::ptr::null_mut(),
+                                DI_NORMAL,
+                            );
+                        }
+                        y += 34;
+                    }
+                }
+            }
+            EndPaint(hwnd, &paint);
             0
         }
         WM_DESTROY => {

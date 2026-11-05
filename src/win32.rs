@@ -9,6 +9,7 @@
 )]
 
 use std::ffi::c_void;
+use std::path::Path;
 
 pub type HWND = *mut c_void;
 pub type HINSTANCE = *mut c_void;
@@ -17,6 +18,8 @@ pub type HMENU = *mut c_void;
 pub type HICON = *mut c_void;
 pub type HCURSOR = *mut c_void;
 pub type HBRUSH = *mut c_void;
+pub type HDC = *mut c_void;
+pub type HANDLE = *mut c_void;
 pub type LPCWSTR = *const u16;
 pub type WPARAM = usize;
 pub type LPARAM = isize;
@@ -42,6 +45,17 @@ pub struct RECT {
     pub top: i32,
     pub right: i32,
     pub bottom: i32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub struct PAINTSTRUCT {
+    pub hdc: HDC,
+    pub fErase: BOOL,
+    pub rcPaint: RECT,
+    pub fRestore: BOOL,
+    pub fIncUpdate: BOOL,
+    pub rgbReserved: [u8; 32],
 }
 
 #[repr(C)]
@@ -89,6 +103,7 @@ pub const WM_CREATE: u32 = 0x0001;
 pub const WM_SIZE: u32 = 0x0005;
 pub const WM_CLOSE: u32 = 0x0010;
 pub const WM_DESTROY: u32 = 0x0002;
+pub const WM_PAINT: u32 = 0x000F;
 pub const WM_KEYDOWN: u32 = 0x0100;
 pub const WM_COMMAND: u32 = 0x0111;
 
@@ -107,6 +122,11 @@ pub const CW_USEDEFAULT: i32 = 0x8000_0000u32 as i32;
 pub const MB_OK: u32 = 0x0000_0000;
 pub const MB_ICONERROR: u32 = 0x0000_0010;
 pub const MB_ICONINFORMATION: u32 = 0x0000_0040;
+
+// Image / icon drawing
+pub const IMAGE_ICON: u32 = 1;
+pub const LR_LOADFROMFILE: u32 = 0x0000_0010;
+pub const DI_NORMAL: u32 = 0x0003;
 
 // Virtual key codes
 pub const VK_RETURN: usize = 0x0D;
@@ -162,6 +182,29 @@ extern "system" {
     ) -> BOOL;
     pub fn LoadCursorW(hInstance: HINSTANCE, lpCursorName: LPCWSTR) -> HCURSOR;
     pub fn MessageBoxW(hWnd: HWND, lpText: LPCWSTR, lpCaption: LPCWSTR, uType: UINT) -> i32;
+    pub fn BeginPaint(hWnd: HWND, lpPaint: *mut PAINTSTRUCT) -> HDC;
+    pub fn EndPaint(hWnd: HWND, lpPaint: *const PAINTSTRUCT) -> BOOL;
+    pub fn FillRect(hDC: HDC, lprc: *const RECT, hbr: HBRUSH) -> i32;
+    pub fn DrawIconEx(
+        hdc: HDC,
+        xLeft: i32,
+        yTop: i32,
+        hIcon: HICON,
+        cxWidth: i32,
+        cyWidth: i32,
+        istepIfAniCur: UINT,
+        hbrFlickerFreeDraw: HBRUSH,
+        diFlags: UINT,
+    ) -> BOOL;
+    pub fn InvalidateRect(hWnd: HWND, lpRect: *const RECT, bErase: BOOL) -> BOOL;
+    pub fn LoadImageW(
+        hInst: HINSTANCE,
+        name: LPCWSTR,
+        type_: UINT,
+        cx: i32,
+        cy: i32,
+        fuLoad: UINT,
+    ) -> HANDLE;
 }
 
 #[link(name = "kernel32")]
@@ -309,6 +352,136 @@ impl Ole32 {
 impl Drop for Ole32 {
     fn drop(&mut self) {
         unsafe {
+            FreeLibrary(self.module);
+        }
+    }
+}
+
+/// `GdiplusStartupInput` with `GdiplusVersion = 1`.
+#[repr(C)]
+pub struct GdiplusStartupInput {
+    pub GdiplusVersion: u32,
+    pub DebugEventCallback: *mut c_void,
+    pub SuppressBackgroundThread: BOOL,
+    pub SuppressExternalCodecs: BOOL,
+}
+
+impl Default for GdiplusStartupInput {
+    fn default() -> Self {
+        GdiplusStartupInput {
+            GdiplusVersion: 1,
+            DebugEventCallback: std::ptr::null_mut(),
+            SuppressBackgroundThread: 0,
+            SuppressExternalCodecs: 0,
+        }
+    }
+}
+
+type GdiplusStartupFn =
+    unsafe extern "system" fn(*mut usize, *const GdiplusStartupInput, *mut c_void) -> i32;
+type GdiplusShutdownFn = unsafe extern "system" fn(usize);
+type GdipCreateBitmapFromFileFn = unsafe extern "system" fn(*const u16, *mut *mut c_void) -> i32;
+type GdipCreateHICONFromBitmapFn = unsafe extern "system" fn(*mut c_void, *mut HICON) -> i32;
+type GdipDisposeImageFn = unsafe extern "system" fn(*mut c_void) -> i32;
+
+/// `gdiplus.dll` loaded on demand, mirroring `Ole32` so the import table stays
+/// `user32`+`kernel32`. Keeps the GDI+ token alive until dropped.
+pub struct Gdiplus {
+    module: HMODULE,
+    token: usize,
+    shutdown: GdiplusShutdownFn,
+    create_bitmap_from_file: GdipCreateBitmapFromFileFn,
+    create_hicon_from_bitmap: GdipCreateHICONFromBitmapFn,
+    dispose_image: GdipDisposeImageFn,
+}
+
+impl Gdiplus {
+    pub fn load() -> Option<Gdiplus> {
+        unsafe {
+            let module = LoadLibraryW(wide("gdiplus.dll").as_ptr());
+            if module.is_null() {
+                return None;
+            }
+            let startup = GetProcAddress(module, c"GdiplusStartup".as_ptr().cast::<u8>());
+            let shutdown = GetProcAddress(module, c"GdiplusShutdown".as_ptr().cast::<u8>());
+            let create_bitmap =
+                GetProcAddress(module, c"GdipCreateBitmapFromFile".as_ptr().cast::<u8>());
+            let create_hicon =
+                GetProcAddress(module, c"GdipCreateHICONFromBitmap".as_ptr().cast::<u8>());
+            let dispose = GetProcAddress(module, c"GdipDisposeImage".as_ptr().cast::<u8>());
+            if startup.is_null()
+                || shutdown.is_null()
+                || create_bitmap.is_null()
+                || create_hicon.is_null()
+                || dispose.is_null()
+            {
+                FreeLibrary(module);
+                return None;
+            }
+
+            let startup: GdiplusStartupFn = std::mem::transmute(startup);
+            let shutdown: GdiplusShutdownFn = std::mem::transmute(shutdown);
+            let create_bitmap_from_file: GdipCreateBitmapFromFileFn =
+                std::mem::transmute(create_bitmap);
+            let create_hicon_from_bitmap: GdipCreateHICONFromBitmapFn =
+                std::mem::transmute(create_hicon);
+            let dispose_image: GdipDisposeImageFn = std::mem::transmute(dispose);
+
+            let input = GdiplusStartupInput::default();
+            let mut token = 0usize;
+            if startup(&mut token, &input, std::ptr::null_mut()) != 0 {
+                FreeLibrary(module);
+                return None;
+            }
+            Some(Gdiplus {
+                module,
+                token,
+                shutdown,
+                create_bitmap_from_file,
+                create_hicon_from_bitmap,
+                dispose_image,
+            })
+        }
+    }
+
+    /// Loads an icon file, trying the native `.ico` loader first and then GDI+
+    /// for PNG/ICO/BMP. Returns `None` instead of failing the whole launcher.
+    pub unsafe fn load_icon(&self, path: &Path) -> Option<HICON> {
+        let name = wide(&path.to_string_lossy());
+        let is_ico = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("ico"))
+            .unwrap_or(false);
+        if is_ico {
+            let icon = LoadImageW(
+                std::ptr::null_mut(),
+                name.as_ptr(),
+                IMAGE_ICON,
+                0,
+                0,
+                LR_LOADFROMFILE,
+            );
+            if !icon.is_null() {
+                return Some(icon as HICON);
+            }
+        }
+
+        let mut bitmap: *mut c_void = std::ptr::null_mut();
+        if (self.create_bitmap_from_file)(name.as_ptr(), &mut bitmap) != 0 || bitmap.is_null() {
+            return None;
+        }
+        let mut icon: HICON = std::ptr::null_mut();
+        let status = (self.create_hicon_from_bitmap)(bitmap, &mut icon);
+        (self.dispose_image)(bitmap);
+        (status == 0 && !icon.is_null()).then_some(icon)
+    }
+}
+
+impl Drop for Gdiplus {
+    fn drop(&mut self) {
+        unsafe {
+            (self.shutdown)(self.token);
             FreeLibrary(self.module);
         }
     }

@@ -1,5 +1,5 @@
-//! Minimal freedesktop `.desktop` parser: extracts `Name=`, `Exec=` and `Path=`
-//! from the `[Desktop Entry]` group.
+//! Minimal freedesktop `.desktop` parser: extracts `Name=`, `Exec=`, `Path=` and
+//! `Icon=` from the `[Desktop Entry]` group.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,6 +10,7 @@ pub struct DesktopEntry {
     pub exec: String,
     pub path: Option<String>,
     pub args: Vec<String>,
+    pub icon: Option<String>,
 }
 
 /// Returns all `*.desktop` entries in `dir`, sorted by file name. Unreadable or
@@ -51,6 +52,7 @@ fn parse_desktop_file(path: &Path) -> Option<DesktopEntry> {
     let mut name: Option<String> = None;
     let mut exec: Option<String> = None;
     let mut cwd: Option<String> = None;
+    let mut icon: Option<String> = None;
     let mut in_entry = false;
 
     for raw in text.lines() {
@@ -74,6 +76,7 @@ fn parse_desktop_file(path: &Path) -> Option<DesktopEntry> {
             // Keep `Exec=` raw: `split_exec` owns its escape handling.
             "Exec" if exec.is_none() => exec = Some(value.to_string()),
             "Path" if cwd.is_none() => cwd = Some(unescape(value)),
+            "Icon" if icon.is_none() => icon = Some(unescape(value)),
             _ => {}
         }
     }
@@ -91,7 +94,100 @@ fn parse_desktop_file(path: &Path) -> Option<DesktopEntry> {
         // be expressed as a Windows directory.
         path: cwd.and_then(|value| windows_cwd(&value)),
         args: parts,
+        icon,
     })
+}
+
+/// Returns candidate icon files for `icon`, in the order the loader should try
+/// them. Files are not checked here; the caller loads candidates until one
+/// succeeds.
+///
+/// Bare names are looked up under `<dir>/icons/<N>x<N>/apps/`, preferring the
+/// smallest size at least 32 pixels, then larger sizes and finally smaller
+/// sizes.
+pub fn icon_candidates(dir: &Path, icon: &str) -> Vec<PathBuf> {
+    let icon = icon.trim();
+    if icon.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    let direct = is_windows_path(icon) || icon.starts_with('/') || icon.contains(['\\', '/']);
+    if direct {
+        let path = PathBuf::from(icon);
+        push_unique(&mut candidates, path.clone());
+        if !has_image_extension(icon) {
+            push_unique(&mut candidates, append_suffix(&path, ".png"));
+            push_unique(&mut candidates, append_suffix(&path, ".ico"));
+        }
+        return candidates;
+    }
+
+    let icons_dir = dir.join("icons");
+    let Ok(read_dir) = fs::read_dir(&icons_dir) else {
+        return candidates;
+    };
+
+    let mut sizes: Vec<u32> = read_dir
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| parse_size_dir(&entry.file_name().to_string_lossy()))
+        .collect();
+    sizes.sort_unstable();
+    sizes.dedup();
+
+    // The first entry >= 32 is the smallest such size; then any larger sizes,
+    // then smaller sizes from largest to smallest.
+    let (mut larger, smaller): (Vec<u32>, Vec<u32>) =
+        sizes.into_iter().partition(|&size| size >= 32);
+    larger.extend(smaller.into_iter().rev());
+
+    let has_extension = has_image_extension(icon);
+    for size in larger {
+        let apps = icons_dir.join(format!("{size}x{size}")).join("apps");
+        if has_extension {
+            push_unique(&mut candidates, apps.join(icon));
+            if let Some(stem) = Path::new(icon).file_stem() {
+                push_unique(&mut candidates, apps.join(stem));
+            }
+        } else {
+            push_unique(&mut candidates, apps.join(format!("{icon}.png")));
+            push_unique(&mut candidates, apps.join(format!("{icon}.ico")));
+            push_unique(&mut candidates, apps.join(icon));
+        }
+    }
+    candidates
+}
+
+fn parse_size_dir(name: &str) -> Option<u32> {
+    let (width, height) = name.split_once(['x', 'X'])?;
+    let width: u32 = width.parse().ok()?;
+    let height: u32 = height.parse().ok()?;
+    (width == height && width > 0).then_some(width)
+}
+
+fn has_image_extension(value: &str) -> bool {
+    Path::new(value)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            ext.eq_ignore_ascii_case("png")
+                || ext.eq_ignore_ascii_case("ico")
+                || ext.eq_ignore_ascii_case("bmp")
+        })
+        .unwrap_or(false)
+}
+
+fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn push_unique(candidates: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !candidates.contains(&candidate) {
+        candidates.push(candidate);
+    }
 }
 
 /// Handles the string escapes allowed in desktop-entry values.
@@ -506,6 +602,98 @@ Type=Application
             entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
             vec!["A", "B"]
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_first_icon_from_desktop_entry_group() {
+        let dir = temp_dir("icon-parse");
+        let file = dir.join("Game.desktop");
+        fs::write(
+            &file,
+            "[Desktop Entry]\nName=Game\nExec=game.exe\nIcon=0FEF_Vortex.0\nIcon=ignored\n[Desktop Action other]\nIcon=also-ignored\n",
+        )
+        .unwrap();
+
+        let entry = parse_desktop_file(&file).unwrap();
+        assert_eq!(entry.icon.as_deref(), Some("0FEF_Vortex.0"));
+        assert_eq!(scan_desktop_files(&dir)[0].icon, entry.icon);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn orders_icon_sizes_by_closeness_to_32() {
+        let dir = temp_dir("icon-order");
+        for size in [16, 48, 64] {
+            fs::create_dir_all(dir.join(format!("icons/{size}x{size}/apps"))).unwrap();
+        }
+        let candidates = icon_candidates(&dir, "Game");
+        let names: Vec<String> = candidates
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            ["48x48", "64x64", "16x16"]
+                .iter()
+                .flat_map(|size| {
+                    ["Game.png", "Game.ico", "Game"].map(|name| {
+                        dir.join(format!("icons/{size}/apps/{name}"))
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                })
+                .collect::<Vec<_>>()
+        );
+
+        let dir2 = temp_dir("icon-order-32");
+        for size in [16, 32, 48] {
+            fs::create_dir_all(dir2.join(format!("icons/{size}x{size}/apps"))).unwrap();
+        }
+        let first = icon_candidates(&dir2, "Game");
+        assert!(first[0].to_string_lossy().contains("32x32"));
+        assert!(first[3].to_string_lossy().contains("48x48"));
+        assert!(first[6].to_string_lossy().contains("16x16"));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn handles_direct_icon_paths_and_extensions() {
+        let dir = temp_dir("icon-direct");
+        assert_eq!(
+            icon_candidates(&dir, r"C:\Games\icon"),
+            vec![
+                PathBuf::from(r"C:\Games\icon"),
+                PathBuf::from(r"C:\Games\icon.png"),
+                PathBuf::from(r"C:\Games\icon.ico"),
+            ]
+        );
+        assert_eq!(
+            icon_candidates(&dir, "/opt/game/icon.PNG"),
+            vec![PathBuf::from("/opt/game/icon.PNG")]
+        );
+
+        for size in [16, 48] {
+            fs::create_dir_all(dir.join(format!("icons/{size}x{size}/apps"))).unwrap();
+        }
+        assert_eq!(
+            icon_candidates(&dir, "Game.png"),
+            vec![
+                dir.join("icons/48x48/apps/Game.png"),
+                dir.join("icons/48x48/apps/Game"),
+                dir.join("icons/16x16/apps/Game.png"),
+                dir.join("icons/16x16/apps/Game"),
+            ]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn returns_no_icon_candidates_without_icons_directory() {
+        let dir = temp_dir("icon-missing");
+        assert!(icon_candidates(&dir, "Game").is_empty());
+        assert!(icon_candidates(&dir, "  ").is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }

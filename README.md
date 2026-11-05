@@ -3,7 +3,9 @@
 A tiny, dependency-free Win32 launcher for Wine/Proton prefixes. It shows a
 native window with one radio button per application found in
 `C:\proton_shortcuts`, launches the selected executable (with optional
-arguments, working directory and environment variables). After a successful
+arguments, working directory and environment variables), and shows each app's
+icon when one can be found. A built-in **Terminal** entry
+(`C:\Windows\Command\start.exe`) is always available. After a successful
 launch the launcher stays open, so you can start another entry; **Escape** or
 **Cancel** closes it.
 
@@ -19,6 +21,7 @@ launch the launcher stays open, so you can start another entry; **Escape** or
    Name=Game One
    Exec="C:\\Games\\Game1\\game.exe" -dx11
    Path=C:\\Games\\Game1
+   Icon=Game.0
    ```
 
 3. Run `launcher.exe` once (for example through Proton). On first start it
@@ -40,6 +43,7 @@ customise arguments, CWD and environment variables:
 apps:
   - name: "Game One"
     path: "C:\\Games\\Game1\\game.exe"
+    icon: "Game.0"
     cwd: "C:\\Games\\Game1"
     args:
       - "-dx11"
@@ -52,6 +56,19 @@ inline list (`args: ["-dx11", "-novid"]`) is accepted too, and a single value
 on the `args:` line (`args: -dx11 -novid`) is split like a Windows command
 line. `#` starts a comment outside quotes. Config files saved as UTF-8
 (optionally with BOM) or UTF-16 with a BOM (as Notepad writes) are read.
+
+`icon` is optional. A bare name is looked up in
+`icons/<size>/apps/<Icon>.png` (`.ico` and extensionless files are also
+tried); the launcher chooses the size closest to 32x32, preferring the smallest
+size at least 32. A Windows/Linux path in `icon` is used directly. Missing or
+unloadable icons are ignored, so the list still works without icon files.
+Existing configs without an `icon` key get icons in memory from a matching
+`.desktop` `Icon=` entry (path first, then app name); the file itself is not
+rewritten.
+
+The **Terminal** entry is appended in memory after the configured apps and is
+never written into a generated `config.yaml`. Add an app with path
+`C:\Windows\Command\start.exe` yourself to customise or replace it.
 
 `Exec=` may point at a Windows `.lnk` shortcut. The launcher resolves it with
 `IShellLinkW`, appends the shortcut's own parameters, and starts the real target
@@ -91,7 +108,9 @@ The matching checksum is `launcher.exe.sha256` next to it.
 
 ## Notes
 
-- No third-party crates: only `std` and raw `user32`/`kernel32` FFI.
+- No third-party crates: only `std` and raw `user32`/`kernel32` FFI. `ole32`
+  (`.lnk` resolution) and `gdiplus` (PNG icon rendering) are loaded on demand
+  at runtime, so they are not in the executable's import table.
 - The binary is built with `#![windows_subsystem = "windows"]`, so no console
   window flashes under Wine.
 - Configuration parsing supports only the schema above (comments, blank lines,

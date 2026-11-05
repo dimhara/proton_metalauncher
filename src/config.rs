@@ -1,8 +1,15 @@
 //! Application model plus a small, schema-specific YAML parser and serializer.
 
-use crate::desktop::{scan_desktop_files, split_windows_args, DesktopEntry};
+use crate::desktop::{
+    normalize_windows_path, scan_desktop_files, split_windows_args, DesktopEntry,
+};
 use std::fs;
 use std::path::Path;
+
+/// Built-in entry that is always appended in memory, never written to a
+/// generated `config.yaml`.
+pub const TERMINAL_NAME: &str = "Terminal";
+pub const TERMINAL_PATH: &str = r"C:\Windows\Command\start.exe";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AppConfig {
@@ -11,6 +18,7 @@ pub struct AppConfig {
     pub cwd: Option<String>,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    pub icon: Option<String>,
 }
 
 impl AppConfig {
@@ -21,6 +29,7 @@ impl AppConfig {
             cwd: entry.path,
             args: entry.args,
             env: Vec::new(),
+            icon: entry.icon,
         }
     }
 }
@@ -52,28 +61,33 @@ impl LauncherConfig {
             // empty result, but never overwrite a hand-edited file we could
             // not understand.
             if !parsed.apps.is_empty() || !is_effectively_empty(&text) {
-                return Ok(parsed);
+                let mut parsed = parsed;
+                backfill_icons(dir, &mut parsed);
+                return Ok(with_terminal(parsed));
             }
         }
 
-        let config = LauncherConfig {
+        let mut config = LauncherConfig {
             apps: scan_desktop_files(dir)
                 .into_iter()
                 .map(AppConfig::from_desktop)
                 .collect(),
         };
+        backfill_icons(dir, &mut config);
 
         fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         fs::write(&file, config.to_yaml())
             .map_err(|e| format!("cannot write {}: {e}", file.display()))?;
-        Ok(config)
+        Ok(with_terminal(config))
     }
 
     /// Re-reads `config.yaml` without generating or modifying anything.
     /// Returns `None` when the file is missing or unreadable.
     pub fn load_existing(dir: &Path) -> Option<LauncherConfig> {
         let bytes = fs::read(dir.join("config.yaml")).ok()?;
-        Some(parse(&decode_text(&bytes)))
+        let mut config = parse(&decode_text(&bytes));
+        backfill_icons(dir, &mut config);
+        Some(with_terminal(config))
     }
 
     /// Serializes the configuration using the canonical layout.
@@ -85,6 +99,9 @@ impl LauncherConfig {
             out.push('\n');
             out.push_str("    path: ");
             out.push_str(&quote(&app.path));
+            out.push('\n');
+            out.push_str("    icon: ");
+            out.push_str(&quote(app.icon.as_deref().unwrap_or("")));
             out.push('\n');
             out.push_str("    cwd: ");
             out.push_str(&quote(app.cwd.as_deref().unwrap_or("")));
@@ -109,7 +126,55 @@ impl LauncherConfig {
 }
 
 fn is_app_key(key: &str) -> bool {
-    matches!(key, "name" | "path" | "cwd" | "args" | "env")
+    matches!(key, "name" | "path" | "cwd" | "args" | "env" | "icon")
+}
+
+/// Fills empty icons in an existing config from matching `.desktop` entries.
+/// The file itself is never rewritten.
+fn backfill_icons(dir: &Path, config: &mut LauncherConfig) {
+    if config.apps.iter().all(|app| app.icon.is_some()) {
+        return;
+    }
+    let entries = scan_desktop_files(dir);
+    let entries: Vec<DesktopEntry> = entries
+        .into_iter()
+        .filter(|entry| entry.icon.is_some())
+        .collect();
+    for app in &mut config.apps {
+        if app.icon.is_some() {
+            continue;
+        }
+        let path = normalize_windows_path(&app.path);
+        let by_path = entries
+            .iter()
+            .find(|entry| normalize_windows_path(&entry.exec).eq_ignore_ascii_case(&path));
+        let matched = by_path.or_else(|| {
+            entries
+                .iter()
+                .find(|entry| entry.name.eq_ignore_ascii_case(&app.name))
+        });
+        if let Some(entry) = matched {
+            app.icon = entry.icon.clone();
+        }
+    }
+}
+
+/// Appends the built-in Terminal entry unless the config already contains an
+/// app with the same normalized path.
+fn with_terminal(mut config: LauncherConfig) -> LauncherConfig {
+    let terminal_path = normalize_windows_path(TERMINAL_PATH);
+    let present = config
+        .apps
+        .iter()
+        .any(|app| normalize_windows_path(&app.path).eq_ignore_ascii_case(&terminal_path));
+    if !present {
+        config.apps.push(AppConfig {
+            name: TERMINAL_NAME.to_string(),
+            path: TERMINAL_PATH.to_string(),
+            ..AppConfig::default()
+        });
+    }
+    config
 }
 
 /// Decodes UTF-8 (with or without BOM) and the UTF-16 forms Notepad can write.
@@ -261,7 +326,7 @@ pub fn parse(text: &str) -> LauncherConfig {
 
         let (key, value) = split_key_value(line);
         match key {
-            "name" | "path" | "cwd" => {
+            "name" | "path" | "cwd" | "icon" => {
                 set_scalar(apps.last_mut(), key, &value);
                 mode = Mode::Scalar;
             }
@@ -293,6 +358,10 @@ fn set_scalar(app: Option<&mut AppConfig>, key: &str, value: &str) {
         "cwd" => {
             let cwd = unquote(value);
             app.cwd = if cwd.is_empty() { None } else { Some(cwd) };
+        }
+        "icon" => {
+            let icon = unquote(value);
+            app.icon = if icon.is_empty() { None } else { Some(icon) };
         }
         _ => {}
     }
@@ -360,7 +429,7 @@ fn quote(s: &str) -> String {
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "apps:\n  - name: \"Game One\"\n    path: \"C:\\\\Games\\\\Game1\\\\game.exe\"\n    cwd: \"C:\\\\Games\\\\Game1\"\n    args:\n      - \"-dx11\"\n    env:\n      DXVK_HUD: \"fps\"\n";
+    const SAMPLE: &str = "apps:\n  - name: \"Game One\"\n    path: \"C:\\\\Games\\\\Game1\\\\game.exe\"\n    icon: \"Game.0\"\n    cwd: \"C:\\\\Games\\\\Game1\"\n    args:\n      - \"-dx11\"\n    env:\n      DXVK_HUD: \"fps\"\n";
 
     #[test]
     fn parses_reference_sample() {
@@ -369,6 +438,7 @@ mod tests {
         let app = &config.apps[0];
         assert_eq!(app.name, "Game One");
         assert_eq!(app.path, r"C:\Games\Game1\game.exe");
+        assert_eq!(app.icon.as_deref(), Some("Game.0"));
         assert_eq!(app.cwd.as_deref(), Some(r"C:\Games\Game1"));
         assert_eq!(app.args, vec!["-dx11"]);
         assert_eq!(app.env, vec![("DXVK_HUD".to_string(), "fps".to_string())]);
@@ -426,9 +496,10 @@ mod tests {
         .unwrap();
 
         let config = LauncherConfig::load_or_create(&dir).unwrap();
-        assert_eq!(config.apps.len(), 1);
+        assert_eq!(config.apps.len(), 2);
         assert_eq!(config.apps[0].name, "Game");
         assert_eq!(config.apps[0].args, vec!["-dx11"]);
+        assert_eq!(config.apps[1].path, TERMINAL_PATH);
 
         let written = fs::read_to_string(dir.join("config.yaml")).unwrap();
         assert!(
@@ -438,6 +509,7 @@ mod tests {
         assert!(written.contains(r#"path: "C:\\Games\\g.exe""#), "{written}");
         assert!(written.contains(r#"cwd: "C:\\Games""#), "{written}");
         assert!(written.contains("    env:\n"), "{written}");
+        assert!(!written.contains("Terminal"), "{written}");
 
         // Once config.yaml exists, the .desktop files are no longer consulted.
         fs::remove_file(dir.join("Game.desktop")).unwrap();
@@ -558,7 +630,8 @@ Exec="C:\\\\Games\\\\g.exe" "-mode 1 -log \\"my log.txt\\""
         .unwrap();
 
         let config = LauncherConfig::load_or_create(&dir).unwrap();
-        assert!(config.apps.is_empty());
+        assert_eq!(config.apps.len(), 1);
+        assert_eq!(config.apps[0].name, TERMINAL_NAME);
         assert_eq!(fs::read_to_string(dir.join("config.yaml")).unwrap(), text);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -567,7 +640,8 @@ Exec="C:\\\\Games\\\\g.exe" "-mode 1 -log \\"my log.txt\\""
     fn empty_config_is_regenerated_when_desktop_files_appear() {
         let dir = temp_dir("empty");
         let config = LauncherConfig::load_or_create(&dir).unwrap();
-        assert!(config.apps.is_empty());
+        assert_eq!(config.apps.len(), 1);
+        assert_eq!(config.apps[0].name, TERMINAL_NAME);
         assert_eq!(
             fs::read_to_string(dir.join("config.yaml")).unwrap(),
             "apps:\n"
@@ -579,8 +653,9 @@ Exec="C:\\\\Games\\\\g.exe" "-mode 1 -log \\"my log.txt\\""
         )
         .unwrap();
         let config = LauncherConfig::load_or_create(&dir).unwrap();
-        assert_eq!(config.apps.len(), 1);
+        assert_eq!(config.apps.len(), 2);
         assert_eq!(config.apps[0].name, "Later");
+        assert_eq!(config.apps[1].name, TERMINAL_NAME);
         assert!(fs::read_to_string(dir.join("config.yaml"))
             .unwrap()
             .contains("Later"));
@@ -595,8 +670,53 @@ Exec="C:\\\\Games\\\\g.exe" "-mode 1 -log \\"my log.txt\\""
             cwd: None,
             args: vec!["a\\b".to_string(), "line\nbreak".to_string()],
             env: vec![("K".to_string(), "v\"1".to_string())],
+            icon: Some("icon.0".to_string()),
         };
         let config = LauncherConfig { apps: vec![app] };
         assert_eq!(parse(&config.to_yaml()), config);
+    }
+
+    #[test]
+    fn backfills_icons_without_rewriting_the_config() {
+        let dir = temp_dir("backfill");
+        let text = "apps:\n  - name: \"A\"\n    path: \"c:/games/a.exe\"\n    cwd: \"\"\n    args:\n    env:\n  - name: \"Bee\"\n    path: \"D:\\\\Other\\\\b.exe\"\n    cwd: \"\"\n    args:\n    env:\n  - name: \"Keep\"\n    path: \"k.exe\"\n    icon: \"kept.0\"\n    cwd: \"\"\n    args:\n    env:\n";
+        fs::write(dir.join("config.yaml"), text).unwrap();
+        fs::write(
+            dir.join("A.desktop"),
+            "[Desktop Entry]\nName=Different\nExec=C:\\\\Games\\\\A.exe\nIcon=A.0\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("B.desktop"),
+            "[Desktop Entry]\nName=Bee\nExec=elsewhere.exe\nIcon=B.0\n",
+        )
+        .unwrap();
+
+        let config = LauncherConfig::load_or_create(&dir).unwrap();
+        assert_eq!(config.apps[0].icon.as_deref(), Some("A.0"));
+        assert_eq!(config.apps[1].icon.as_deref(), Some("B.0"));
+        assert_eq!(config.apps[2].icon.as_deref(), Some("kept.0"));
+        assert_eq!(config.apps[3].name, TERMINAL_NAME);
+        assert_eq!(fs::read_to_string(dir.join("config.yaml")).unwrap(), text);
+
+        let reloaded = LauncherConfig::load_existing(&dir).unwrap();
+        assert_eq!(reloaded.apps[0].icon.as_deref(), Some("A.0"));
+        assert_eq!(reloaded.apps[1].icon.as_deref(), Some("B.0"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn terminal_can_be_overridden_by_adding_its_path() {
+        let dir = temp_dir("terminal-override");
+        fs::write(
+            dir.join("config.yaml"),
+            "apps:\n  - name: \"My terminal\"\n    path: \"c:/WINDOWS/command/START.EXE\"\n    icon: \"term.0\"\n    cwd: \"\"\n    args:\n    env:\n",
+        )
+        .unwrap();
+
+        let config = LauncherConfig::load_or_create(&dir).unwrap();
+        assert_eq!(config.apps.len(), 1);
+        assert_eq!(config.apps[0].name, "My terminal");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
