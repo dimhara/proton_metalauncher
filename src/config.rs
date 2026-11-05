@@ -1,6 +1,6 @@
 //! Application model plus a small, schema-specific YAML parser and serializer.
 
-use crate::desktop::{scan_desktop_files, DesktopEntry};
+use crate::desktop::{scan_desktop_files, split_windows_args, DesktopEntry};
 use std::fs;
 use std::path::Path;
 
@@ -45,11 +45,13 @@ impl LauncherConfig {
         if file.exists() {
             let bytes =
                 fs::read(&file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
-            let parsed = parse(&String::from_utf8_lossy(&bytes));
+            let text = decode_text(&bytes);
+            let parsed = parse(&text);
             // An empty config almost always means the first run found no
             // .desktop files. Re-scan instead of locking the user into the
-            // empty result.
-            if !parsed.apps.is_empty() {
+            // empty result, but never overwrite a hand-edited file we could
+            // not understand.
+            if !parsed.apps.is_empty() || !is_effectively_empty(&text) {
                 return Ok(parsed);
             }
         }
@@ -65,6 +67,13 @@ impl LauncherConfig {
         fs::write(&file, config.to_yaml())
             .map_err(|e| format!("cannot write {}: {e}", file.display()))?;
         Ok(config)
+    }
+
+    /// Re-reads `config.yaml` without generating or modifying anything.
+    /// Returns `None` when the file is missing or unreadable.
+    pub fn load_existing(dir: &Path) -> Option<LauncherConfig> {
+        let bytes = fs::read(dir.join("config.yaml")).ok()?;
+        Some(parse(&decode_text(&bytes)))
     }
 
     /// Serializes the configuration using the canonical layout.
@@ -103,6 +112,122 @@ fn is_app_key(key: &str) -> bool {
     matches!(key, "name" | "path" | "cwd" | "args" | "env")
 }
 
+/// Decodes UTF-8 (with or without BOM) and the UTF-16 forms Notepad can write.
+fn decode_text(bytes: &[u8]) -> String {
+    let text = if bytes.starts_with(&[0xFF, 0xFE]) {
+        let units: Vec<u16> = bytes[2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else if bytes.starts_with(&[0xFE, 0xFF]) {
+        let units: Vec<u16> = bytes[2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_be_bytes(*pair))
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    text.strip_prefix('\u{feff}').unwrap_or(&text).to_string()
+}
+
+/// True when a config only contains the `apps:` header, comments and blank
+/// lines. Such a file is safe to regenerate from `.desktop` files.
+fn is_effectively_empty(text: &str) -> bool {
+    text.lines().all(|raw| {
+        let line = strip_comment(raw.trim()).trim();
+        line.is_empty() || line == "apps:" || line == "apps: []"
+    })
+}
+
+/// Strips a trailing YAML comment. A `#` starts a comment only at the start of
+/// the line or after whitespace, and never inside quotes.
+fn strip_comment(line: &str) -> &str {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (index, c) in line.char_indices() {
+        match quote {
+            Some(q) => {
+                if escaped {
+                    escaped = false;
+                } else if q == '"' && c == '\\' {
+                    escaped = true;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '#' => {
+                let at_start = index == 0
+                    || line[..index]
+                        .chars()
+                        .next_back()
+                        .is_none_or(char::is_whitespace);
+                if at_start {
+                    return line[..index].trim_end();
+                }
+            }
+            None => {}
+        }
+    }
+    line
+}
+
+/// Splits the inside of an inline YAML list (`["a", "b"]`) on top-level
+/// commas, ignoring commas inside quotes.
+fn split_flow_items(value: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut start = 0;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (index, c) in value.char_indices() {
+        match quote {
+            Some(q) => {
+                if escaped {
+                    escaped = false;
+                } else if q == '"' && c == '\\' {
+                    escaped = true;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == ',' => {
+                items.push(&value[start..index]);
+                start = index + c.len_utf8();
+            }
+            None => {}
+        }
+    }
+    items.push(&value[start..]);
+    items
+}
+
+/// Arguments written on the `args:` line itself. Both an inline list and a
+/// single scalar command line are accepted; the canonical form is a block
+/// list on the following lines.
+fn parse_inline_args(value: &str) -> Vec<String> {
+    let value = value.trim();
+    if let Some(inner) = value
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        split_flow_items(inner)
+            .into_iter()
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(unquote)
+            .collect()
+    } else {
+        split_windows_args(&unquote(value))
+    }
+}
+
 /// Parses the supported YAML subset. Unknown lines are skipped, so a partially
 /// hand-edited file still yields every app it can understand.
 pub fn parse(text: &str) -> LauncherConfig {
@@ -110,8 +235,8 @@ pub fn parse(text: &str) -> LauncherConfig {
     let mut mode = Mode::Scalar;
 
     for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
+        let line = strip_comment(raw.trim()).trim();
+        if line.is_empty() {
             continue;
         }
         if line == "apps:" {
@@ -120,7 +245,9 @@ pub fn parse(text: &str) -> LauncherConfig {
 
         if let Some(rest) = line.strip_prefix("- ") {
             let (key, value) = split_key_value(rest);
-            if is_app_key(key) {
+            // A `- ` line is an app only when it is `- key: ...` with a known
+            // key; otherwise it is an argument (e.g. `- "-dx11"`).
+            if is_app_key(key) && rest.contains(':') {
                 apps.push(AppConfig::default());
                 mode = Mode::Scalar;
                 set_scalar(apps.last_mut(), key, &value);
@@ -138,7 +265,12 @@ pub fn parse(text: &str) -> LauncherConfig {
                 set_scalar(apps.last_mut(), key, &value);
                 mode = Mode::Scalar;
             }
-            "args" => mode = Mode::Args,
+            "args" => {
+                if let Some(app) = apps.last_mut() {
+                    app.args.extend(parse_inline_args(&value));
+                }
+                mode = Mode::Args;
+            }
             "env" => mode = Mode::Env,
             _ => {
                 if mode == Mode::Env {
@@ -311,6 +443,123 @@ mod tests {
         fs::remove_file(dir.join("Game.desktop")).unwrap();
         assert_eq!(LauncherConfig::load_or_create(&dir).unwrap(), config);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generated_config_keeps_shortcut_argument_boundaries() {
+        let dir = temp_dir("shortcut-args");
+        fs::write(
+            dir.join("Game.desktop"),
+            r#"[Desktop Entry]
+Name=Game
+Exec="C:\\\\Games\\\\g.exe" "-mode 1 -log \\"my log.txt\\""
+"#,
+        )
+        .unwrap();
+
+        let config = LauncherConfig::load_or_create(&dir).unwrap();
+        assert_eq!(
+            config.apps[0].args,
+            vec!["-mode", "1", "-log", "my log.txt"]
+        );
+
+        let written = fs::read_to_string(dir.join("config.yaml")).unwrap();
+        assert!(written.contains("      - \"my log.txt\"\n"), "{written}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_inline_argument_list() {
+        let config =
+            parse("apps:\n  - name: \"G\"\n    path: \"g.exe\"\n    args: [\"-a\", \"-b,c\"]\n");
+        assert_eq!(config.apps[0].args, vec!["-a", "-b,c"]);
+    }
+
+    #[test]
+    fn parses_scalar_arguments_as_a_command_line() {
+        let config = parse("apps:\n  - name: \"G\"\n    path: \"g.exe\"\n    args: \"-a -b c\"\n");
+        assert_eq!(config.apps[0].args, vec!["-a", "-b", "c"]);
+
+        let config = parse("apps:\n  - name: \"G\"\n    path: \"g.exe\"\n    args: -a -b\n");
+        assert_eq!(config.apps[0].args, vec!["-a", "-b"]);
+    }
+
+    #[test]
+    fn strips_comments_and_keeps_quoted_hashes() {
+        let config = parse(
+            "apps:\n  - name: \"G\" # app\n    path: \"g.exe\"\n    args:\n      - \"-a#1\" # note\n      - \"-b #2\"\n",
+        );
+        assert_eq!(config.apps[0].name, "G");
+        assert_eq!(config.apps[0].args, vec!["-a#1", "-b #2"]);
+    }
+
+    #[test]
+    fn argument_named_like_a_key_stays_an_argument() {
+        let config =
+            parse("apps:\n  - name: \"G\"\n    path: \"g.exe\"\n    args:\n      - name\n");
+        assert_eq!(config.apps.len(), 1);
+        assert_eq!(config.apps[0].args, vec!["name"]);
+    }
+
+    #[test]
+    fn reads_utf16_config_files() {
+        let dir = temp_dir("utf16");
+        let text = "apps:\n  - name: \"G\"\n    path: \"g.exe\"\n    args:\n      - \"-u16\"\n";
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        fs::write(dir.join("config.yaml"), &bytes).unwrap();
+
+        let config = LauncherConfig::load_or_create(&dir).unwrap();
+        assert_eq!(config.apps[0].args, vec!["-u16"]);
+        assert_eq!(fs::read(dir.join("config.yaml")).unwrap(), bytes);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_existing_sees_edited_arguments() {
+        let dir = temp_dir("reload");
+        let file = dir.join("config.yaml");
+        let write = |arg: &str| {
+            fs::write(
+                &file,
+                format!(
+                    "apps:\n  - name: \"G\"\n    path: \"g.exe\"\n    args:\n      - \"{arg}\"\n"
+                ),
+            )
+            .unwrap();
+        };
+
+        write("-old");
+        assert_eq!(
+            LauncherConfig::load_existing(&dir).unwrap().apps[0].args,
+            vec!["-old"]
+        );
+        write("-new");
+        assert_eq!(
+            LauncherConfig::load_existing(&dir).unwrap().apps[0].args,
+            vec!["-new"]
+        );
+        assert!(LauncherConfig::load_existing(&dir.join("missing")).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unparsable_config_is_not_overwritten() {
+        let dir = temp_dir("keep");
+        let text = "apps:\n  name: \"G\"\n  path: \"g.exe\"\n  args:\n    - \"-x\"\n";
+        fs::write(dir.join("config.yaml"), text).unwrap();
+        fs::write(
+            dir.join("Found.desktop"),
+            "[Desktop Entry]\nName=Found\nExec=found.exe\n",
+        )
+        .unwrap();
+
+        let config = LauncherConfig::load_or_create(&dir).unwrap();
+        assert!(config.apps.is_empty());
+        assert_eq!(fs::read_to_string(dir.join("config.yaml")).unwrap(), text);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -29,8 +29,12 @@ launch the launcher stays open, so you can start another entry; **Escape** or
 
 If `config.yaml` already exists and lists at least one app, `.desktop` files
 are ignored. An empty `config.yaml` (no apps) is regenerated from the
-`.desktop` files, so adding shortcuts later just needs another run. Edit the
-YAML to customise arguments, CWD and environment variables:
+`.desktop` files, so adding shortcuts later just needs another run; a
+non-empty file that cannot be parsed is left untouched. The launcher re-reads
+`config.yaml` before every launch, so editing arguments, CWD or environment
+variables takes effect without restarting (adding/removing apps needs a
+restart because the radio list is built at startup). Edit the YAML to
+customise arguments, CWD and environment variables:
 
 ```yaml
 apps:
@@ -43,15 +47,29 @@ apps:
       DXVK_HUD: "fps"
 ```
 
+`args` is normally a list, one argument per `- "..."` line. For convenience an
+inline list (`args: ["-dx11", "-novid"]`) is accepted too, and a single value
+on the `args:` line (`args: -dx11 -novid`) is split like a Windows command
+line. `#` starts a comment outside quotes. Config files saved as UTF-8
+(optionally with BOM) or UTF-16 with a BOM (as Notepad writes) are read.
+
 `Exec=` may point at a Windows `.lnk` shortcut. The launcher resolves it with
 `IShellLinkW`, appends the shortcut's own parameters, and starts the real target
 with `args`/`cwd`/`env` from the config; if resolution fails it falls back to
 `explorer.exe`. Wine-style `Path=` values (`.../dosdevices/c:/Program Files/...`)
 are rewritten to `C:\Program Files\...`.
 
+Proton writes a shortcut's argument string as one quoted token in the generated
+`.desktop` file (`Exec="C:\\...\\game.exe" "-mode 1 -log foo"`). The launcher
+splits that token with Windows command-line rules, so the target receives the
+same individual arguments as it would from the `.lnk` itself.
+
+If a `.lnk` cannot be resolved, the launcher opens it through `explorer.exe`;
+arguments from `config.yaml` cannot be forwarded in that fallback.
+
 Delete `config.yaml` to force a full rescan of the `.desktop` files. (Do this
-once after upgrading from a version that mangled `.lnk` paths, such as a split
-`Exec=` with the remainder in `args`.)
+once after upgrading from a version that mangled `.lnk` paths or passed the
+whole shortcut argument string as a single argument.)
 
 ## Build
 

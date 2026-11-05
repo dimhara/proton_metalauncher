@@ -122,59 +122,72 @@ fn unescape(s: &str) -> String {
 /// Splits an `Exec=` value into program and arguments, respecting quotes and
 /// dropping `%`-field codes.
 ///
-/// The files Proton tooling generates are not strictly spec-compliant: Windows
-/// paths are double-escaped (`C:\\\\Games`), and spaces are escaped as `\ ` rather
-/// than `\s`. Both forms are handled here.
+/// The value is unescaped first and then split according to the `Exec`
+/// quoting rules, as the specification requires. That also handles the files
+/// Proton tooling generates, which are not strictly spec-compliant: Windows
+/// paths are double-escaped (`C:\\\\Games`) and spaces may be escaped as `\ `
+/// rather than `\s`.
 fn split_exec(exec: &str) -> Vec<String> {
+    let value = unescape(exec);
+    let mut parts = split_exec_tokens(&value);
+
+    // winemenubuilder writes a shortcut's whole argument string as one quoted
+    // token: `Exec="C:\\...\\game.exe" "-mode 1 -log ..."`. Those arguments
+    // have to be split like the shortcut's own command line, otherwise the
+    // target receives them as a single argument.
+    // winemenubuilder always quotes the program too (`Exec="C:\\...\\game.exe"
+    // "-mode 1"`), which distinguishes it from a normal quoted single
+    // argument such as `Exec=game "one argument with spaces"`.
+    if parts.len() == 2 && parts[0].1 && parts[1].1 && is_windows_path(&parts[0].0) {
+        let args = split_windows_args(&parts[1].0);
+        parts.truncate(1);
+        parts.extend(args.into_iter().map(|arg| (arg, false)));
+    }
+
+    parts
+        .into_iter()
+        .map(|(part, _)| part)
+        .filter(|part| !part.starts_with('%'))
+        .collect()
+}
+
+/// Tokenizes an already unescaped `Exec=` value. The boolean marks tokens that
+/// started with a quote; the winemenubuilder compatibility path needs it.
+fn split_exec_tokens(value: &str) -> Vec<(String, bool)> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut started = false;
+    let mut quoted = false;
     let mut quote: Option<char> = None;
-    let mut chars = exec.chars().peekable();
+    let mut chars = value.chars().peekable();
 
     while let Some(c) = chars.next() {
         match quote {
             Some(q) if c == q => quote = None,
+            Some(_) if c == '\\' => {
+                push_exec_escape(&mut current, &mut chars);
+                started = true;
+            }
             Some(_) => {
                 current.push(c);
                 started = true;
             }
             None if c == '"' || c == '\'' => {
+                if !started {
+                    quoted = true;
+                }
                 quote = Some(c);
                 started = true;
             }
             None if c == '\\' => {
-                let mut count = 1;
-                while chars.peek() == Some(&'\\') {
-                    chars.next();
-                    count += 1;
-                }
-                match chars.peek() {
-                    Some(next) if next.is_whitespace() => {
-                        // `\ ` (or `\\ `) is an escaped space.
-                        current.push(' ');
-                        chars.next();
-                        started = true;
-                    }
-                    Some('"') | Some('\'') => {
-                        current.push(chars.next().unwrap());
-                        started = true;
-                    }
-                    _ => {
-                        if current.is_empty() && count >= 2 {
-                            // Keep a UNC prefix intact.
-                            current.push_str("\\\\");
-                        } else {
-                            current.push('\\');
-                        }
-                        started = true;
-                    }
-                }
+                push_exec_escape(&mut current, &mut chars);
+                started = true;
             }
             None if c.is_whitespace() => {
                 if started {
-                    parts.push(std::mem::take(&mut current));
+                    parts.push((std::mem::take(&mut current), quoted));
                     started = false;
+                    quoted = false;
                 }
             }
             None => {
@@ -184,22 +197,79 @@ fn split_exec(exec: &str) -> Vec<String> {
         }
     }
     if started {
-        parts.push(current);
+        parts.push((current, quoted));
     }
-
     parts
-        .into_iter()
-        .filter(|part| !part.starts_with('%'))
-        .map(|part| decode_arg(&part))
-        .collect()
 }
 
-fn decode_arg(part: &str) -> String {
-    if is_windows_path(part) {
-        normalize_windows_path(part)
-    } else {
-        unescape(part)
+/// Applies the `Exec` quoting escape rules. A backslash before whitespace is
+/// accepted as an escaped space, as written by Proton tooling.
+fn push_exec_escape(out: &mut String, chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    match chars.peek().copied() {
+        Some(next) if next.is_whitespace() => {
+            out.push(' ');
+            chars.next();
+        }
+        Some(next) if matches!(next, '"' | '\'' | '`' | '$' | '\\') => {
+            out.push(next);
+            chars.next();
+        }
+        // Not a quoting escape (for example a hand-written `C:\Games`): keep
+        // the backslash and let the next character be processed normally.
+        _ => out.push('\\'),
     }
+}
+
+/// Splits a Windows command line with the `CommandLineToArgvW` rules, so an
+/// argument string taken from a shortcut reaches the target unchanged. Also
+/// used for a scalar `args:` value in `config.yaml`.
+pub(crate) fn split_windows_args(command_line: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut started = false;
+    let mut chars = command_line.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if !in_quotes && c.is_whitespace() {
+            if started {
+                args.push(std::mem::take(&mut current));
+                started = false;
+            }
+            continue;
+        }
+        started = true;
+        match c {
+            '"' => in_quotes = !in_quotes,
+            '\\' => {
+                let mut count = 1;
+                while chars.peek() == Some(&'\\') {
+                    chars.next();
+                    count += 1;
+                }
+                if chars.peek() == Some(&'"') {
+                    // 2n backslashes leave n backslashes; an odd one also
+                    // escapes the quote instead of ending the argument.
+                    for _ in 0..count / 2 {
+                        current.push('\\');
+                    }
+                    if count % 2 == 1 {
+                        current.push('"');
+                        chars.next();
+                    }
+                } else {
+                    for _ in 0..count {
+                        current.push('\\');
+                    }
+                }
+            }
+            _ => current.push(c),
+        }
+    }
+    if started {
+        args.push(current);
+    }
+    args
 }
 
 /// True for `C:\...`, `C:/...` and `\\server\share` paths.
@@ -285,6 +355,62 @@ mod tests {
             parts,
             vec!["/opt/My Game/run.sh", "--foo", "bar baz", "--x=%f"]
         );
+    }
+
+    #[test]
+    fn splits_winemenubuilder_argument_blob() {
+        let dir = temp_dir("lnk-args");
+        let file = dir.join("game.desktop");
+        // Exact shape winemenubuilder writes: the shortcut's whole argument
+        // string is a single quoted token.
+        fs::write(
+            &file,
+            r#"[Desktop Entry]
+Name=My Game
+Exec="C:\\\\Games\\\\game.exe" "-mode 1 -log \\"my log.txt\\""
+Type=Application
+"#,
+        )
+        .unwrap();
+
+        let entry = parse_desktop_file(&file).unwrap();
+        assert_eq!(entry.exec, r"C:\Games\game.exe");
+        assert_eq!(entry.args, vec!["-mode", "1", "-log", "my log.txt"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_winemenubuilder_args_add_no_argument() {
+        let dir = temp_dir("lnk-noargs");
+        let file = dir.join("game.desktop");
+        fs::write(
+            &file,
+            "[Desktop Entry]\nName=Game\nExec=\"C:\\\\Games\\\\game.exe\" \"\"\n",
+        )
+        .unwrap();
+
+        let entry = parse_desktop_file(&file).unwrap();
+        assert_eq!(entry.exec, r"C:\Games\game.exe");
+        assert!(entry.args.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn separate_quoted_arguments_stay_separate() {
+        let parts = split_exec(r#""C:\\Games\\game.exe" "-foo" "-bar baz""#);
+        assert_eq!(parts, vec![r"C:\Games\game.exe", "-foo", "-bar baz"]);
+    }
+
+    #[test]
+    fn single_quoted_argument_with_spaces_is_not_resplit() {
+        // A normal Exec line with one quoted argument must not be mistaken
+        // for winemenubuilder's flattened shortcut arguments.
+        let parts = split_exec(r#"game "one argument with spaces""#);
+        assert_eq!(parts, vec!["game", "one argument with spaces"]);
+
+        // Same when the program itself is quoted but is not a Windows path.
+        let parts = split_exec(r#""/opt/My Game/game" "one argument with spaces""#);
+        assert_eq!(parts, vec!["/opt/My Game/game", "one argument with spaces"]);
     }
 
     #[test]

@@ -20,6 +20,8 @@ use std::sync::OnceLock;
 
 #[cfg(windows)]
 static CONFIG: OnceLock<LauncherConfig> = OnceLock::new();
+#[cfg(windows)]
+static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 #[cfg(windows)]
 const ID_LAUNCH: i32 = 1;
@@ -75,6 +77,7 @@ fn run() -> Result<(), String> {
 
     let dir = base_dir();
     let config = LauncherConfig::load_or_create(&dir)?;
+    let _ = CONFIG_DIR.set(dir.clone());
     if config.apps.is_empty() {
         return Err(format!(
             "No applications configured in {}.\n\nEdit {}\\config.yaml or add .desktop files and run the launcher again.",
@@ -344,9 +347,19 @@ unsafe fn launch_selected(hwnd: win32::HWND) {
         config.apps.iter().enumerate().find(|(index, _)| {
             IsDlgButtonChecked(hwnd, ID_RADIO_BASE + *index as i32) == BST_CHECKED
         });
-    let Some((_, app)) = selected else {
+    let Some((index, _)) = selected else {
         return;
     };
+
+    // Re-read the file so edits made while the window is open take effect
+    // without restarting. If the app list itself changed, keep using the
+    // cached entry: the radio buttons still show the old list.
+    let app = CONFIG_DIR
+        .get()
+        .and_then(|dir| LauncherConfig::load_existing(dir))
+        .filter(|fresh| fresh.apps.len() == config.apps.len())
+        .and_then(|fresh| fresh.apps.into_iter().nth(index))
+        .unwrap_or_else(|| config.apps[index].clone());
 
     let path = desktop::normalize_windows_path(&app.path);
     let mut command;
