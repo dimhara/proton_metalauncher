@@ -116,6 +116,7 @@ pub const BN_CLICKED: u16 = 0;
 
 // Misc
 pub const SW_SHOW: i32 = 5;
+pub const SW_SHOWNORMAL: i32 = 1;
 pub const IDC_ARROW: usize = 32512;
 pub const COLOR_WINDOW: usize = 5;
 pub const CW_USEDEFAULT: i32 = 0x8000_0000u32 as i32;
@@ -316,6 +317,8 @@ pub type CoCreateInstanceFn = unsafe extern "system" fn(
     *mut *mut c_void,
 ) -> HRESULT;
 pub type CoUninitializeFn = unsafe extern "system" fn();
+pub type ShellExecuteWFn =
+    unsafe extern "system" fn(HWND, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, i32) -> HINSTANCE;
 
 /// `ole32.dll` loaded on demand so the import table stays `user32`+`kernel32`.
 pub struct Ole32 {
@@ -350,6 +353,41 @@ impl Ole32 {
 }
 
 impl Drop for Ole32 {
+    fn drop(&mut self) {
+        unsafe {
+            FreeLibrary(self.module);
+        }
+    }
+}
+
+/// `shell32.dll` loaded on demand, mirroring `Ole32`, so the import table stays
+/// `user32`+`kernel32`.
+pub struct Shell32 {
+    module: HMODULE,
+    pub shell_execute: ShellExecuteWFn,
+}
+
+impl Shell32 {
+    pub fn load() -> Option<Shell32> {
+        unsafe {
+            let module = LoadLibraryW(wide("shell32.dll").as_ptr());
+            if module.is_null() {
+                return None;
+            }
+            let execute = GetProcAddress(module, c"ShellExecuteW".as_ptr().cast::<u8>());
+            if execute.is_null() {
+                FreeLibrary(module);
+                return None;
+            }
+            Some(Shell32 {
+                module,
+                shell_execute: std::mem::transmute::<*mut c_void, ShellExecuteWFn>(execute),
+            })
+        }
+    }
+}
+
+impl Drop for Shell32 {
     fn drop(&mut self) {
         unsafe {
             FreeLibrary(self.module);

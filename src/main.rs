@@ -447,17 +447,26 @@ unsafe fn launch_selected(hwnd: win32::HWND) {
         .unwrap_or_else(|| config.apps[index].clone());
 
     let path = desktop::normalize_windows_path(&app.path);
+    let app_args: Vec<&str> = app.args.iter().map(String::as_str).collect();
     let mut command;
     let mut shortcut_cwd = None;
+    let target: String;
+    let mut params: String;
 
     if path.to_ascii_lowercase().ends_with(".lnk") {
         match resolve_shortcut(&path) {
             Some(shortcut) => {
-                command = Command::new(desktop::normalize_windows_path(&shortcut.target));
+                target = desktop::normalize_windows_path(&shortcut.target);
+                command = Command::new(&target);
                 command.args(&app.args);
+                params = join_params(&app_args);
                 if !shortcut.args.is_empty() {
                     use std::os::windows::process::CommandExt;
                     command.raw_arg(&shortcut.args);
+                    if !params.is_empty() {
+                        params.push(' ');
+                    }
+                    params.push_str(&shortcut.args);
                 }
                 if !shortcut.cwd.is_empty() {
                     shortcut_cwd = Some(desktop::normalize_windows_path(&shortcut.cwd));
@@ -466,13 +475,17 @@ unsafe fn launch_selected(hwnd: win32::HWND) {
             // Advertised or exotic shortcuts may not resolve to a path; let
             // the shell open those instead.
             None => {
-                command = Command::new("explorer.exe");
+                target = "explorer.exe".to_string();
+                command = Command::new(&target);
                 command.arg(&path);
+                params = join_params(&[&path]);
             }
         }
     } else {
+        target = path.clone();
         command = Command::new(&path);
         command.args(&app.args);
+        params = join_params(&app_args);
     }
 
     let cwd = app
@@ -481,7 +494,7 @@ unsafe fn launch_selected(hwnd: win32::HWND) {
         .filter(|value| !value.is_empty())
         .map(|value| desktop::windows_cwd(value).unwrap_or_else(|| value.to_string()))
         .or(shortcut_cwd);
-    if let Some(cwd) = cwd {
+    if let Some(cwd) = cwd.as_deref() {
         command.current_dir(cwd);
     }
     for (key, value) in &app.env {
@@ -498,14 +511,62 @@ unsafe fn launch_selected(hwnd: win32::HWND) {
         // Stay open so another entry can be launched.
         Ok(_) => {}
         Err(error) => {
-            let message = format!(
-                "Failed to launch \"{}\":\n{}\n\nPath: {}\nCWD: {}",
-                app.name,
-                error,
-                path,
-                app.cwd.as_deref().unwrap_or("(inherited)")
-            );
-            message_box(hwnd, &message, "Proton App Launcher", MB_OK | MB_ICONERROR);
+            if shell_fallback_error(error.raw_os_error()) {
+                // The target is not a PE image (e.g. .chm, .pdf, .url, folder):
+                // let the Windows shell open it with its file association.
+                let shell_error = Shell32::load().map(|shell| {
+                    let operation = wide("open");
+                    let file = wide(&target);
+                    let parameters = wide(&params);
+                    let directory = cwd.as_deref().map(wide);
+                    let result = (shell.shell_execute)(
+                        std::ptr::null_mut(),
+                        operation.as_ptr(),
+                        file.as_ptr(),
+                        if params.is_empty() {
+                            std::ptr::null()
+                        } else {
+                            parameters.as_ptr()
+                        },
+                        match directory.as_deref() {
+                            Some(value) => value.as_ptr(),
+                            None => std::ptr::null(),
+                        },
+                        SW_SHOWNORMAL,
+                    );
+                    result as isize
+                });
+                let shell_note = match shell_error {
+                    Some(code) if code > 32 => return,
+                    Some(code) => {
+                        format!(
+                            "No shell association handled it either (ShellExecute error {code})."
+                        )
+                    }
+                    None => {
+                        "No shell association handled it either (shell32.dll could not be loaded)."
+                            .to_string()
+                    }
+                };
+                let message = format!(
+                    "Failed to launch \"{}\":\n{}\n\n{}\nPath: {}\nCWD: {}",
+                    app.name,
+                    error,
+                    shell_note,
+                    path,
+                    cwd.as_deref().unwrap_or("(inherited)")
+                );
+                message_box(hwnd, &message, "Proton App Launcher", MB_OK | MB_ICONERROR);
+            } else {
+                let message = format!(
+                    "Failed to launch \"{}\":\n{}\n\nPath: {}\nCWD: {}",
+                    app.name,
+                    error,
+                    path,
+                    app.cwd.as_deref().unwrap_or("(inherited)")
+                );
+                message_box(hwnd, &message, "Proton App Launcher", MB_OK | MB_ICONERROR);
+            }
         }
     }
 }
@@ -624,4 +685,62 @@ unsafe fn read_link_target(
 fn utf16z(buffer: &[u16]) -> String {
     let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
     String::from_utf16_lossy(&buffer[..len])
+}
+
+/// Whether a `CreateProcess` failure should be retried through the Windows
+/// shell file association. `193` is `ERROR_BAD_EXE_FORMAT`, `11` is
+/// `ERROR_BAD_FORMAT`.
+fn shell_fallback_error(code: Option<i32>) -> bool {
+    matches!(code, Some(193) | Some(11))
+}
+
+/// Joins arguments into a Windows command line. Quoting is deliberately simple:
+/// an argument is wrapped in double quotes only when it is empty or contains a
+/// space, tab, quote or backslash. Embedded quotes are not escaped.
+fn join_params(args: &[&str]) -> String {
+    args.iter()
+        .map(|arg| {
+            let quote = arg.is_empty() || arg.chars().any(|c| matches!(c, ' ' | '\t' | '"' | '\\'));
+            if quote {
+                format!("\"{arg}\"")
+            } else {
+                (*arg).to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_fallback_only_for_bad_format_errors() {
+        assert!(shell_fallback_error(Some(193)));
+        assert!(shell_fallback_error(Some(11)));
+        assert!(!shell_fallback_error(Some(2)));
+        assert!(!shell_fallback_error(Some(5)));
+        assert!(!shell_fallback_error(None));
+    }
+
+    #[test]
+    fn join_params_keeps_plain_argument_unquoted() {
+        assert_eq!(join_params(&["--fullscreen"]), "--fullscreen");
+    }
+
+    #[test]
+    fn join_params_quotes_argument_with_spaces() {
+        assert_eq!(join_params(&["hello world"]), "\"hello world\"");
+    }
+
+    #[test]
+    fn join_params_quotes_empty_argument() {
+        assert_eq!(join_params(&[""]), "\"\"");
+    }
+
+    #[test]
+    fn join_params_separates_multiple_arguments_with_single_spaces() {
+        assert_eq!(join_params(&["a", "b c", "d"]), "a \"b c\" d");
+    }
 }

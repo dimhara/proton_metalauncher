@@ -84,6 +84,11 @@ same individual arguments as it would from the `.lnk` itself.
 If a `.lnk` cannot be resolved, the launcher opens it through `explorer.exe`;
 arguments from `config.yaml` cannot be forwarded in that fallback.
 
+If a shortcut or a config entry points at a document (for example a `.chm`
+file) or a folder, the launcher opens it with its Windows default association
+instead of failing with a format error (environment variables from
+`config.yaml` are not applied in that case).
+
 Delete `config.yaml` to force a full rescan of the `.desktop` files. (Do this
 once after upgrading from a version that mangled `.lnk` paths or passed the
 whole shortcut argument string as a single argument.)
